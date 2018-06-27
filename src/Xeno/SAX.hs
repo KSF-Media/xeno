@@ -1,24 +1,28 @@
-{-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiWayIf                 #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 
 -- | SAX parser and API for XML.
 
 module Xeno.SAX
   ( process
+  , tagScanner
   , fold
   , validate
   , dump
+  , Located(..)
+  , Location(..)
   ) where
 
 import           Control.Exception
 import           Control.Monad.State.Strict
 import           Control.Spork
-import           Data.ByteString (ByteString)
-import qualified Data.ByteString as S
-import qualified Data.ByteString.Char8 as S8
-import qualified Data.ByteString.Unsafe as SU
+import           Data.ByteString            (ByteString)
+import qualified Data.ByteString            as S
+import qualified Data.ByteString.Char8      as S8
+import qualified Data.ByteString.Unsafe     as SU
 import           Data.Functor.Identity
 import           Data.Monoid
 import           Data.Word
@@ -243,6 +247,99 @@ process openF attrF endOpenF textF closeF cdataF str = findLT 0
                        (ByteString -> IO ()) ->
                          (ByteString -> IO ()) ->
                            (ByteString -> IO ()) -> ByteString -> IO ()
+               #-}
+
+newtype Position = Position Int
+  deriving (Show, Num)
+
+data Location = Location
+  { locationStart :: {-# UNPACK #-} !Int
+  , locationEnd   :: {-# UNPACK #-} !Int
+  } deriving (Show)
+
+data Located a = Located {-# UNPACK #-} !Location {-# UNPACK #-} !a
+  deriving (Show)
+
+located :: Int -> Int -> a -> Located a
+located locationStart locationEnd = Located Location{..}
+
+tagScanner
+  :: (Monad m)
+  => (Located ByteString -> m ()) -- ^ begin element
+  -> (Located ByteString -> m ()) -- ^ end element
+  -> ByteString
+  -> m ()
+tagScanner beginF endF str = findLT 0
+  where
+    findLT index =
+      case elemIndexFrom openTagChar str index of
+        Nothing -> pure ()
+        Just fromLt ->
+          findTagName (fromLt + 1)
+    findTagName index0 = do
+      let spaceOrCloseTag = parseName str index
+      if | s_index str index0 == questionChar ->
+           case elemIndexFrom closeTagChar str spaceOrCloseTag of
+             Nothing -> throw (XenoParseError index "Couldn't find the end of the tag.")
+             Just fromGt -> do
+               findLT (fromGt +1)
+         | s_index str spaceOrCloseTag == closeTagChar ->
+           do let tagname = substring str index spaceOrCloseTag
+              if s_index str index0 == slashChar
+                then endF (located (index0 - 1) spaceOrCloseTag $! tagname)
+                else do
+                  beginF (located (index0 - 1) spaceOrCloseTag $! tagname)
+              findLT (spaceOrCloseTag + 1)
+         | otherwise ->
+           do let tagname = substring str index spaceOrCloseTag
+              result <- findAttributes spaceOrCloseTag
+              case result of
+                Right closingTag -> do
+                  beginF (located (index0 - 1) closingTag tagname)
+                  findLT (closingTag + 1)
+                Left closingPair -> do
+                  endF (located (index0 - 1) (closingPair + 1) tagname)
+                  findLT (closingPair + 2)
+      where
+        index =
+          if s_index str index0 == slashChar
+            then index0 + 1
+            else index0
+    findAttributes index0 =
+      if s_index str index == slashChar &&
+         s_index str (index + 1) == closeTagChar
+        then pure (Left index)
+        else if s_index str index == closeTagChar
+               then pure (Right index)
+               else let afterAttrName = parseName str index
+                    in if s_index str afterAttrName == equalChar
+                         then let quoteIndex = afterAttrName + 1
+                                  usedChar = s_index str quoteIndex
+                              in if usedChar == quoteChar ||
+                                    usedChar == doubleQuoteChar
+                                   then case elemIndexFrom
+                                               usedChar
+                                               str
+                                               (quoteIndex + 1) of
+                                          Nothing ->
+                                            throw (XenoParseError index "Couldn't find the matching quote character.")
+                                          Just endQuoteIndex -> do
+                                            findAttributes (endQuoteIndex + 1)
+                                   else throw (XenoParseError index ("Expected ' or \", got: " <> S.singleton usedChar))
+                         else throw (XenoParseError index ("Expected =, got: " <> S.singleton (s_index str afterAttrName) <> " at character index: " <> (S8.pack . show) afterAttrName))
+      where
+        index = skipSpaces str index0
+
+{-# INLINE tagScanner #-}
+{-# SPECIALISE tagScanner ::
+                 (Located ByteString -> IO ()) ->
+                   (Located ByteString -> IO ()) ->
+                     ByteString -> IO ()
+               #-}
+{-# SPECIALISE tagScanner ::
+                 (Located ByteString -> Identity ()) ->
+                   (Located ByteString -> Identity ()) ->
+                     ByteString -> Identity ()
                #-}
 
 --------------------------------------------------------------------------------
